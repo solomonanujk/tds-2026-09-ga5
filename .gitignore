@@ -1,0 +1,6 @@
+__pycache__/
+.fastembed/
+*.pyc
+.venv/
+q3/*.mp4
+q3/frames/

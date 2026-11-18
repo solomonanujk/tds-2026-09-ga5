@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: tds-ga5
+    runtime: python
+    plan: free
+    # Bake the embedding model into the build so a cold start never downloads it.
+    buildCommand: pip install -r requirements.txt && python -c "from ga5 import rag; assert rag.DENSE.ok, rag.DENSE.error"
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: FASTEMBED_CACHE
+        value: /opt/render/project/src/.fastembed
+      - key: GA5_DEBUG_TOKEN
+        sync: false
