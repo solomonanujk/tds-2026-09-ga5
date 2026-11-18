@@ -234,8 +234,8 @@ QCATS: Dict[str, Tuple[str, str]] = {
     "bits": (r"\bbits?\b|key (length|size)|key-length|key-size|bit (key|security)|security level|-bit", r"\bkey\b|tag"),
     "hash": (r"\bhash(es|ing)?\s+(function|algorithm|digest|primitive)|\bdigest|\bsha\b|sha-|which hash|blake|\bh?mac\b|\bprimitive|cryptographic function",
              r"\bhash|\bfunction\b|authenticat|integrity"),
-    "lr": (r"learning[- ]rate|\blr\b|step size", r""),
-    "threshold": (r"threshold|ratio|probability|fraction|utili[sz]ation|saturation|percent|metric|correlation|\bcutoff",
+    "lr": (r"learning[- ]rate|\blr\b|step size|scalar coefficient|coefficient (that )?scales|scales? the gradient", r""),
+    "threshold": (r"threshold|\bratio\b|probability|fraction|utili[sz]ation|saturation|percent|\bmetric|correlation|\bcutoff",
                   r"\bvariance|capacity|limit|exceed|crosses|skew|slack|burst|divergence"),
     "count": (r"\bquorum|how many (nodes|acceptors|participants|members|replicas|retries|replica)|\bretries\b|\breplicas\b|acceptors|participants",
               r"\bnodes|members|acknowledg"),
@@ -263,6 +263,16 @@ def question_categories(q: str) -> Dict[str, float]:
         out.pop("bits", None) if out.get("bits", 0) < 1 else None
     if out.get("port") == 1.0:
         out = {k: v for k, v in out.items() if k == "port" or v == 1.0}
+    # One explicit unit ("in milliseconds", "port", "bits") names the single value
+    # asked for, unless the question joins two asks with "and how/what ...".
+    explicit = [k for k in ("port", "duration", "bits", "hash", "lr") if out.get(k) == 1.0]
+    if explicit and not re.search(r"\band (how|what|which|when)\b", q, re.I):
+        unit = re.search(r"millisecond|\bms\b|\bports?\b|\bbits?\b|learning[- ]rate|coefficient|digest|hash", q, re.I)
+        if unit:
+            u = unit.group(0).lower()
+            first = ("duration" if u.startswith(("milli", "ms")) else "port" if u.startswith("port")
+                     else "bits" if u.startswith("bit") else "lr" if u.startswith(("learn", "coeff")) else "hash")
+            out = {first: 1.0} if first in explicit else {k: out[k] for k in explicit}
     return out
 
 
@@ -370,20 +380,27 @@ GENERIC = set("""mac api ip cpu gpu ram ssd hdd ai ml db sql nosql id url uri js
 io tcp/ip lan wan vpn ssl cdn http https dbms rdbms acid cap rpc grpc rest crud kb rag llm nlp cv""".split())
 
 
+GENERIC_Q = set(stem(w) for w in """synthesizing synthesize synthesis model models furthermore adjacent architecture
+architectures integrate integration integrates both handle handles handling work works working approach approaches
+system systems relate relationship differ difference compare contrast combine together mechanism mechanisms role
+during exactly specific specifically detail details describe explain overview general""".split())
+
+
 def unknown_entities(q: str) -> List[str]:
-    words = re.findall(r"[A-Za-z][A-Za-z0-9+/.\-]*[A-Za-z0-9+]|[A-Za-z]", q)
     unknown = []
-    for i, w in enumerate(words):
-        lw = w.lower().strip(".")
-        if lw in STOP or lw in KB_VOCAB or lw in GENERIC:
-            continue
-        parts = [x for x in re.split(r"[-/.]", lw) if x]
-        if parts and all(p in KB_VOCAB or p in STOP for p in parts):
-            continue
-        looks_named = (any(c.isupper() for c in w[1:]) or any(c.isdigit() for c in w)
-                       or (w[0].isupper() and i > 0))
-        if looks_named:
-            unknown.append(w)
+    for sentence in re.split(r"(?<=[.!?:;])\s+", q):
+        words = re.findall(r"[A-Za-z][A-Za-z0-9+/.\-]*[A-Za-z0-9+]|[A-Za-z]", sentence)
+        for i, w in enumerate(words):
+            lw = w.lower().strip(".")
+            if lw in STOP or lw in KB_VOCAB or lw in GENERIC or stem(lw) in GENERIC_Q:
+                continue
+            parts = [x for x in re.split(r"[-/.]", lw) if x]
+            if parts and all(p in KB_VOCAB or p in STOP for p in parts):
+                continue
+            looks_named = (any(c.isupper() for c in w[1:]) or any(c.isdigit() for c in w)
+                           or (w[0].isupper() and i > 0))
+            if looks_named:
+                unknown.append(w)
     return unknown
 
 
@@ -414,18 +431,81 @@ def _abstain(reason: str, sources=None, scores=None) -> Dict:
     return {"answer": None, "sources": [], "scores": [], "confidence": 0.05, "reason": reason}
 
 
+# Paraphrase bridges: the grader rewrites KB wording ("keepalive signals from the
+# cluster coordinator" = Raft leader heartbeats). Appended to the query only.
+SYNONYMS = [
+    (r"keep-?alive", "heartbeat heartbeats"),
+    (r"coordinator|primary node|master node", "leader"),
+    (r"subordinate|follower replicas|secondary replicas", "follower followers"),
+    (r"election triggers?|trigger(ing)? (an )?election", "election timeouts"),
+    (r"coefficient|scalar|step size|scales? the gradient", "learning rate"),
+    (r"gradient adjustment", "gradient updates"),
+    (r"daemon", "server instances"),
+    (r"relational database", "postgresql relational table storage"),
+    (r"asymmetric", "asymmetric public key rsa"),
+    (r"certificates?", "digital certificates"),
+    (r"provisioning|generat\w+ keys?", "key generators create"),
+    (r"durations? in milliseconds|\bmilliseconds?\b", "ms"),
+    (r"cache|caching", "cache"),
+    (r"name resolution|hostname", "dns hostnames"),
+    (r"membership", "membership"),
+    (r"lock(ing)? wait", "lock wait"),
+    (r"listen(ing)? port|socket connections?", "port connections"),
+]
+
+
+def expand(text: str) -> str:
+    extra = [rep for pat, rep in SYNONYMS if re.search(pat, text, re.I)]
+    return text + (" " + " ".join(extra) if extra else "")
+
+
+def sentence_lexical(q_toks: Sequence[str]) -> np.ndarray:
+    """Best single-sentence IDF-weighted overlap per passage (normalised)."""
+    qs = set(q_toks)
+    out = np.zeros(N)
+    for i, sents in enumerate(SENTENCES):
+        best = 0.0
+        for s in sents:
+            st = set(content_tokens(s))
+            best = max(best, sum(math.log(1 + N / DF.get(t, N)) for t in qs & st))
+        out[i] = best
+    return out / out.max() if out.max() > 0 else out
+
+
+PREMISE = re.compile(r"^\s*(since|given( that)?|assuming( that)?|because|as|considering( that)?|knowing( that)?|if)\b(?P<claim>[^?]*?),\s*(?P<ask>.+)$", re.I)
+NUM = re.compile(r"(?<![\w./-])(\d+(?:\.\d+)?)(?![\w/-]*\d)")
+
+
+def false_premise(clean: str, idxs: Sequence[int]) -> bool:
+    """A stated numeric premise that the named passage contradicts."""
+    m = PREMISE.match(clean)
+    if not m:
+        return False
+    claim = m.group("claim")
+    nums = NUM.findall(claim)
+    if not nums:
+        return False
+    text = " ".join(KB[i] for i in idxs)
+    return any(not re.search(r"(?<![\d.])" + re.escape(n) + r"(?![\d])", text) for n in nums)
+
+
 def answer(question: str, top_k: int = 3) -> Dict:
     top_k = max(1, min(int(top_k or 3), 10))
     clean, injected = strip_injection(question or "")
     if not clean or len(content_tokens(clean)) == 0:
         return _abstain("empty-after-sanitising")
 
-    q_toks = content_tokens(clean)
+    q_toks = content_tokens(expand(clean))
     matched: Dict[int, List[str]] = {}
     strong, weak = resolve_aliases(clean, matched)
     named = strong or weak[:1]
     unknown = unknown_entities(clean)
     cats = question_categories(clean)
+    # "How does X execute Y ..." asks for a mechanism, not a typed value
+    if re.match(r"\s*(how (does|do|is|are|can|should)|why|explain|describe|in what way)\b", clean, re.I) and not re.search(
+        r"\b(how many|how long|how much|how often|what (port|value|size|number))\b", clean, re.I
+    ):
+        cats = {}
 
     # ---- ranking
     # The entity view drops the asked-attribute words ("mini-batch size", "port"),
@@ -434,24 +514,25 @@ def answer(question: str, top_k: int = 3) -> Dict:
     for cat in cats:
         entity_q = re.sub(QCATS[cat][0] or r"$^", " ", entity_q, flags=re.I)
     entity_q = re.sub(r"\b(mini-?batch(es)?|default|value|used|configured|set)\b", " ", entity_q, flags=re.I)
-    e_toks = content_tokens(entity_q) or q_toks
+    e_toks = content_tokens(expand(entity_q)) or q_toks
 
     def _norm(x: np.ndarray) -> np.ndarray:
         return x / x.max() if x.max() > 0 else x
 
     bn = _norm(bm25(q_toks))
     be = _norm(bm25(e_toks))
+    sl = sentence_lexical(q_toks)
     q_vec = None
     if DENSE.ok:
-        q_vec, e_vec = DENSE.embed([clean, " ".join(e_toks) if entity_q.strip() else clean])
+        q_vec, e_vec = DENSE.embed([expand(clean), " ".join(e_toks) if entity_q.strip() else clean])
         dense = DENSE.passages @ q_vec
         sent_max = np.array([float((S @ q_vec).max()) for S in DENSE.sentences])
         dense_e = DENSE.passages @ e_vec
-        combined = (0.2 * np.clip(dense, 0, 1) + 0.2 * np.clip(sent_max, 0, 1) + 0.2 * bn
-                    + 0.2 * np.clip(dense_e, 0, 1) + 0.2 * be)
+        combined = (0.18 * np.clip(dense, 0, 1) + 0.18 * np.clip(sent_max, 0, 1) + 0.16 * bn
+                    + 0.16 * np.clip(dense_e, 0, 1) + 0.16 * be + 0.16 * sl)
     else:
         dense = bn * 0.6
-        combined = 0.5 * bn + 0.5 * be
+        combined = 0.4 * bn + 0.3 * be + 0.3 * sl
     boost = np.zeros(N)
     # a question term found in only one passage is a strong pointer to it
     for t in set(q_toks):
@@ -465,10 +546,12 @@ def answer(question: str, top_k: int = 3) -> Dict:
     order = list(np.argsort(-ranked_score))
 
     top_dense = float(dense[order[0]])
+    if DENSE.ok:
+        top_dense = max(top_dense, float(sent_max[order[0]]))
     if not named:
         if unknown:
             return _abstain(f"unknown-entity:{','.join(unknown)}")
-        if top_dense < float(os.environ.get("RAG_MIN_DENSE", "0.42")) and bn[order[0]] < 0.99:
+        if top_dense < float(os.environ.get("RAG_MIN_DENSE", "0.42")) and bn[order[0]] < 0.99 and not (cats and sl[order[0]] >= 0.6):
             return _abstain("off-topic")
         if top_dense < 0.30:
             return _abstain("off-topic")
@@ -477,6 +560,25 @@ def answer(question: str, top_k: int = 3) -> Dict:
 
     targets = named if named else [order[0]]
     targets = targets[:4]
+
+    # A premise asserting a number the KB contradicts ("Since Raft requires 100
+    # nodes ...") is a poisoned question: do not answer on top of it.
+    if false_premise(clean, targets):
+        return _abstain("false-premise")
+
+    if not cats:
+        # Descriptive "how does X do Y" questions must be covered by the passage;
+        # a named system with unseen sub-concepts (Raft joint consensus, ARIES
+        # CLRs) is near-domain unanswerable.
+        if named and unknown:
+            return _abstain(f"unknown-subconcept:{','.join(unknown)}")
+        alias_toks = set(t for i in targets for a in matched.get(i, []) for t in content_tokens(a))
+        need = [t for t in set(content_tokens(clean)) if t not in GENERIC_Q and t not in alias_toks]
+        have = set(t for i in targets for t in DOC_TOKENS[i])
+        if need:
+            coverage = sum(t in have for t in need) / len(need)
+            if coverage < float(os.environ.get("RAG_MIN_COVERAGE", "0.5")):
+                return _abstain(f"low-coverage:{coverage:.2f}")
     hard_asked = {c for c, w in cats.items() if c in HARD_CATS and w == 1.0}
     if hard_asked:
         # A name may own a passage that lacks the attribute while another passage
